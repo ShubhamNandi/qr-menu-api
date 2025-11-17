@@ -12,6 +12,7 @@ import io
 import zipfile
 import socket
 import time
+import random
 from pathlib import Path
 import qrcode
 try:
@@ -22,10 +23,12 @@ except ImportError:
 # Initialize FastAPI app
 app = FastAPI(title="QR Menu API", version="1.0.0")
 
-# CORS configuration - allow frontend on port 9111
+# CORS configuration - allow frontend on port 9111 (both HTTP and HTTPS)
+# Allow localhost and common local IP patterns
+# This is safe for local network use
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:9111", "http://192.168.0.137:9111", "http://127.0.0.1:9111"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\d+\.\d+\.\d+\.\d+):9111",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,6 +37,7 @@ app.add_middleware(
 # File paths
 BASE_DIR = Path(__file__).parent
 TABLE_MAPPING_FILE = BASE_DIR / "table-mapping.json"
+PIN_MAPPING_FILE = BASE_DIR / "pin-mapping.json"
 ORDERS_FILE = BASE_DIR / "qr_menu_orders.json"
 
 # QR Code Configuration
@@ -44,6 +48,10 @@ CACHE_TTL = 30  # Cache IP for 30 seconds
 # Initialize files if they don't exist
 if not TABLE_MAPPING_FILE.exists():
     with open(TABLE_MAPPING_FILE, 'w') as f:
+        json.dump({}, f)
+
+if not PIN_MAPPING_FILE.exists():
+    with open(PIN_MAPPING_FILE, 'w') as f:
         json.dump({}, f)
 
 if not ORDERS_FILE.exists():
@@ -72,6 +80,13 @@ class OrderCreate(BaseModel):
 
 class OrderUpdate(BaseModel):
     status: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": "delivered"
+            }
+        }
 
 
 class OrderResponse(BaseModel):
@@ -81,6 +96,20 @@ class OrderResponse(BaseModel):
     total: int
     timestamp: str
     status: str
+
+
+class ReadyOrderItem(BaseModel):
+    """Ready order item for robot delivery system"""
+    table_number: str
+    order_id: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "table_number": "Table_1",
+                "order_id": "abc123-def456-ghi789"
+            }
+        }
 
 
 class TableMappingCreate(BaseModel):
@@ -121,6 +150,38 @@ def generate_table_token(table_number: int) -> str:
     # Generate a short unique token using UUID
     short_uuid = str(uuid.uuid4()).replace('-', '')[:12]
     return f"table{table_number}_token_{short_uuid}"
+
+
+def generate_table_pin(existing_pins: set = None) -> str:
+    """Generate a unique 4-digit PIN for a table"""
+    if existing_pins is None:
+        existing_pins = set()
+    
+    # Generate a random 4-digit PIN
+    max_attempts = 1000
+    for _ in range(max_attempts):
+        pin = f"{random.randint(1000, 9999)}"
+        if pin not in existing_pins:
+            return pin
+    
+    # Fallback: if all 4-digit PINs are taken (unlikely), use UUID-based
+    short_uuid = str(uuid.uuid4()).replace('-', '')[:4]
+    return short_uuid
+
+
+def load_pin_mapping() -> dict:
+    """Load PIN mapping from JSON file"""
+    try:
+        with open(PIN_MAPPING_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        return {}
+
+
+def save_pin_mapping(mapping: dict):
+    """Save PIN mapping to JSON file"""
+    with open(PIN_MAPPING_FILE, 'w') as f:
+        json.dump(mapping, f, indent=2)
 
 
 def get_ip():
@@ -207,8 +268,10 @@ def get_frontend_url():
         return fallback
 
 
-def generate_qr_code_image(url: str, size: int = 10, border: int = 4) -> bytes:
-    """Generate QR code image as PNG bytes"""
+def generate_qr_code_image(url: str, size: int = 10, border: int = 4, pin: str = None) -> bytes:
+    """Generate QR code image as PNG bytes with optional PIN text below"""
+    from PIL import Image, ImageDraw, ImageFont
+    
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -219,6 +282,41 @@ def generate_qr_code_image(url: str, size: int = 10, border: int = 4) -> bytes:
     qr.make(fit=True)
     
     img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Add PIN text below QR code if provided
+    if pin:
+        # Calculate dimensions
+        qr_width, qr_height = img.size
+        text_height = 60  # Space for text
+        padding = 20
+        
+        # Create new image with space for text
+        new_img = Image.new('RGB', (qr_width, qr_height + text_height + padding), 'white')
+        new_img.paste(img, (0, 0))
+        
+        # Draw text
+        draw = ImageDraw.Draw(new_img)
+        
+        # Try to use a nice font, fallback to default if not available
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        except:
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 32)
+            except:
+                font = ImageFont.load_default()
+        
+        # Center the text
+        text = f"Table PIN: {pin}"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_x = (qr_width - text_width) // 2
+        text_y = qr_height + padding
+        
+        # Draw text
+        draw.text((text_x, text_y), text, fill='black', font=font)
+        
+        img = new_img
     
     # Convert to bytes
     img_bytes = io.BytesIO()
@@ -257,6 +355,18 @@ async def get_table_number(token: str):
     
     if table_number is None:
         raise HTTPException(status_code=404, detail="Invalid token")
+    
+    return {"table_number": table_number}
+
+
+@app.get("/api/qr-menu/table/pin/{pin}")
+async def get_table_number_from_pin(pin: str):
+    """Get table number from PIN"""
+    pin_mapping = load_pin_mapping()
+    table_number = pin_mapping.get(pin)
+    
+    if table_number is None:
+        raise HTTPException(status_code=404, detail="Invalid PIN")
     
     return {"table_number": table_number}
 
@@ -309,10 +419,81 @@ async def get_orders(table: Optional[int] = None, status: Optional[str] = None):
     return orders
 
 
+@app.get("/api/qr-menu/orders/ready", response_model=List[ReadyOrderItem])
+async def get_ready_orders():
+    """
+    Get ready orders for robot delivery system.
+    
+    Returns a list of ready orders with table number and order_id.
+    Robot uses order_id to mark orders as delivered or failed.
+    
+    **Example Response:**
+    ```json
+    [
+        {
+            "table_number": "Table_1",
+            "order_id": "abc123-def456-ghi789"
+        },
+        {
+            "table_number": "Table_4",
+            "order_id": "xyz789-uvw456-rst123"
+        }
+    ]
+    ```
+    
+    Returns empty array `[]` if no ready orders exist.
+    """
+    orders = load_orders()
+    
+    # Filter orders with status="ready"
+    ready_orders = [o for o in orders if o.get("status") == "ready"]
+    
+    if not ready_orders:
+        return []
+    
+    # Format as JSON with table_number and order_id
+    result = [
+        ReadyOrderItem(
+            table_number=f"Table_{o.get('table_number')}",
+            order_id=o.get("order_id")
+        )
+        for o in ready_orders
+    ]
+    
+    return result
+
+
 @app.patch("/api/qr-menu/orders/{order_id}")
 async def update_order_status(order_id: str, update: OrderUpdate):
-    """Update order status"""
+    """
+    Update order status.
+    
+    Used by robot to mark orders as delivered or failed.
+    
+    Request body example:
+    {
+        "status": "delivered"
+    }
+    
+    or
+    
+    {
+        "status": "failed"
+    }
+    
+    Valid statuses: "pending", "ready", "delivered", "failed"
+    
+    Returns the updated order object.
+    """
     orders = load_orders()
+    
+    # Validate status
+    valid_statuses = ["pending", "ready", "delivered", "failed"]
+    if update.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+        )
     
     # Find order
     order_found = False
@@ -356,7 +537,7 @@ async def get_all_tables():
 
 @app.post("/api/qr-menu/admin/tables/configure")
 async def configure_tables(config: TableConfig):
-    """Configure total number of tables - auto-generates tokens and mappings (admin only)"""
+    """Configure total number of tables - auto-generates tokens, PINs and mappings (admin only)"""
     if config.total_tables < 1:
         raise HTTPException(status_code=400, detail="Total tables must be at least 1")
     
@@ -365,15 +546,25 @@ async def configure_tables(config: TableConfig):
     
     # Generate new mappings
     new_mapping = {}
+    new_pin_mapping = {}
+    existing_pins = set()
+    
     for table_num in range(1, config.total_tables + 1):
         token = generate_table_token(table_num)
+        pin = generate_table_pin(existing_pins)
+        existing_pins.add(pin)
         new_mapping[token] = table_num
+        new_pin_mapping[pin] = table_num
     
-    # Save the new mapping (replaces all existing)
+    # Save the new mappings (replaces all existing)
     save_table_mapping(new_mapping)
+    save_pin_mapping(new_pin_mapping)
     
     # Convert to list format for response
-    tables = [{"token": token, "table_number": table_num} for token, table_num in new_mapping.items()]
+    tables = []
+    for token, table_num in new_mapping.items():
+        pin = next((p for p, tn in new_pin_mapping.items() if tn == table_num), None)
+        tables.append({"token": token, "table_number": table_num, "pin": pin})
     tables.sort(key=lambda x: x["table_number"])
     
     return {
@@ -388,17 +579,21 @@ async def configure_tables(config: TableConfig):
 async def get_qr_code_for_table(table_number: int):
     """Generate QR code for a specific table (admin only)"""
     mapping = load_table_mapping()
+    pin_mapping = load_pin_mapping()
     
     # Find token for this table number
     token = next((t for t, tn in mapping.items() if tn == table_number), None)
     if token is None:
         raise HTTPException(status_code=404, detail=f"Table {table_number} not found")
     
+    # Find PIN for this table number
+    pin = next((p for p, tn in pin_mapping.items() if tn == table_number), None)
+    
     # Generate QR code URL
     qr_url = f"{get_frontend_url()}?t={token}"
     
-    # Generate QR code image
-    qr_image = generate_qr_code_image(qr_url)
+    # Generate QR code image with PIN
+    qr_image = generate_qr_code_image(qr_url, pin=pin)
     
     return Response(
         content=qr_image,
@@ -413,6 +608,7 @@ async def get_qr_code_for_table(table_number: int):
 async def get_all_qr_codes():
     """Generate QR codes for all tables as a ZIP file (admin only)"""
     mapping = load_table_mapping()
+    pin_mapping = load_pin_mapping()
     
     if not mapping:
         raise HTTPException(status_code=404, detail="No tables configured. Please configure tables first.")
@@ -421,11 +617,14 @@ async def get_all_qr_codes():
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for token, table_number in mapping.items():
+            # Find PIN for this table number
+            pin = next((p for p, tn in pin_mapping.items() if tn == table_number), None)
+            
             # Generate QR code URL
             qr_url = f"{get_frontend_url()}?t={token}"
             
-            # Generate QR code image
-            qr_image = generate_qr_code_image(qr_url)
+            # Generate QR code image with PIN
+            qr_image = generate_qr_code_image(qr_url, pin=pin)
             
             # Add to ZIP
             zip_file.writestr(f"table_{table_number}_qr_code.png", qr_image)
@@ -445,14 +644,18 @@ async def get_all_qr_codes():
 async def get_qr_codes_info():
     """Get QR code URLs for all tables (admin only)"""
     mapping = load_table_mapping()
+    pin_mapping = load_pin_mapping()
     
     tables_info = []
     frontend_url = get_frontend_url()
     for token, table_number in sorted(mapping.items(), key=lambda x: x[1]):
+        # Find PIN for this table number
+        pin = next((p for p, tn in pin_mapping.items() if tn == table_number), None)
         qr_url = f"{frontend_url}?t={token}"
         tables_info.append({
             "table_number": table_number,
             "token": token,
+            "pin": pin,
             "qr_url": qr_url
         })
     
