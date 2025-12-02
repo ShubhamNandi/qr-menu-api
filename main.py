@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import uuid
@@ -15,10 +15,23 @@ import time
 import random
 from pathlib import Path
 import qrcode
+import sys
+from collections import defaultdict
 try:
     import netifaces
 except ImportError:
     netifaces = None
+
+# Add the robot data script path to sys.path
+ROBOT_DATA_SCRIPT_PATH = Path("/home/socwt/soc/src/path_and_mission_toolkit/scripts")
+if str(ROBOT_DATA_SCRIPT_PATH) not in sys.path:
+    sys.path.insert(0, str(ROBOT_DATA_SCRIPT_PATH))
+
+# Import RobotDataSummaryGenerator
+try:
+    from robot_data_python import RobotDataSummaryGenerator
+except ImportError:
+    RobotDataSummaryGenerator = None
 
 # Initialize FastAPI app
 app = FastAPI(title="QR Menu API", version="1.0.0")
@@ -39,6 +52,7 @@ BASE_DIR = Path(__file__).parent
 TABLE_MAPPING_FILE = BASE_DIR / "table-mapping.json"
 PIN_MAPPING_FILE = BASE_DIR / "pin-mapping.json"
 ORDERS_FILE = BASE_DIR / "qr_menu_orders.json"
+ROBOT_DATA_LOG_FILE = Path("/home/socwt/soc/robot_logs/robot_data_log.json")
 
 # QR Code Configuration
 FRONTEND_PORT = os.getenv("FRONTEND_PORT", "9111")
@@ -768,6 +782,347 @@ async def bulk_update_tables(bulk: TableMappingBulk):
         "message": "Table mappings updated successfully",
         "total_tables": len(bulk.mappings),
         "mappings": bulk.mappings
+    }
+
+
+# Robot Logs Dashboard API Endpoints
+def load_robot_data():
+    """Load robot data from JSON file"""
+    try:
+        if not ROBOT_DATA_LOG_FILE.exists():
+            return None
+        with open(ROBOT_DATA_LOG_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading robot data: {e}")
+        return None
+
+
+def parse_timestamp(timestamp_str):
+    """Parse timestamp string to datetime object"""
+    try:
+        return datetime.strptime(timestamp_str, "%Y-%m-%d %I:%M:%S %p")
+    except:
+        try:
+            return datetime.strptime(timestamp_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
+        except:
+            return None
+
+
+def calculate_hourly_orders(data, hours=24):
+    """Calculate orders per hour for the last N hours"""
+    missions = data.get("all_missions", [])
+    hourly_counts = defaultdict(int)
+    
+    # Get current time and calculate time range
+    now = datetime.now()
+    cutoff_time = now - timedelta(hours=hours)
+    
+    for mission in missions:
+        if not mission.get("is_delivery", False):
+            continue
+        
+        start_time_str = mission.get("start_time", "")
+        if not start_time_str:
+            continue
+        
+        mission_time = parse_timestamp(start_time_str)
+        if mission_time and mission_time >= cutoff_time:
+            hour = mission_time.hour
+            hourly_counts[hour] += 1
+    
+    # Fill in all hours with 0 if no data
+    result = []
+    for i in range(24):
+        result.append({
+            "hour": i,
+            "orders": hourly_counts.get(i, 0)
+        })
+    
+    return result
+
+
+def calculate_daily_trips(data, days=7):
+    """Calculate trips per day for the last N days"""
+    missions = data.get("all_missions", [])
+    daily_counts = defaultdict(int)
+    
+    # Get current date and calculate date range
+    now = datetime.now()
+    
+    for mission in missions:
+        start_time_str = mission.get("start_time", "")
+        if not start_time_str:
+            continue
+        
+        mission_time = parse_timestamp(start_time_str)
+        if mission_time:
+            date_key = mission_time.strftime("%Y-%m-%d")
+            # Only include missions from the last N days
+            if (now - mission_time).days <= days:
+                daily_counts[date_key] += 1
+    
+    # Get last N days and format
+    result = []
+    for i in range(days - 1, -1, -1):
+        date = now - timedelta(days=i)
+        date_key = date.strftime("%Y-%m-%d")
+        date_str = date.strftime("%b %d")
+        result.append({
+            "date": date_str,
+            "trips": daily_counts.get(date_key, 0)
+        })
+    
+    return result
+
+
+def calculate_metrics(data):
+    """Calculate all dashboard metrics from robot data"""
+    if not data:
+        return None
+    
+    missions = data.get("all_missions", [])
+    sessions = data.get("sessions", [])
+    
+    # Filter unique missions
+    unique_missions = {}
+    for mission in missions:
+        mission_id = mission.get("mission_id")
+        if mission_id and mission_id not in unique_missions:
+            unique_missions[mission_id] = mission
+    
+    missions_list = list(unique_missions.values())
+    
+    # Calculate basic stats
+    total_missions = len(missions_list)
+    completed_missions = sum(1 for m in missions_list if m.get("status") == "COMPLETED")
+    failed_missions = sum(1 for m in missions_list if m.get("status") == "FAILED")
+    total_deliveries = sum(1 for m in missions_list if m.get("is_delivery", False))
+    
+    total_distance = sum(m.get("total_distance_m", 0) for m in missions_list)
+    total_moving_time = sum(m.get("moving_time_sec", 0) for m in missions_list)
+    total_idle_time = sum(m.get("idle_time_sec", 0) for m in missions_list)
+    
+    # Calculate runtime from sessions
+    if sessions:
+        total_runtime = sum(s.get("session_duration_sec", 0) for s in sessions)
+    else:
+        total_runtime = total_moving_time + total_idle_time
+    
+    # Calculate metrics
+    success_rate = (completed_missions / total_missions * 100) if total_missions > 0 else 0
+    robot_utilization = (total_moving_time / total_runtime * 100) if total_runtime > 0 else 0
+    orders_per_hour = (total_deliveries / total_runtime * 3600) if total_runtime > 0 else 0
+    avg_speed = (total_distance / total_moving_time) if total_moving_time > 0 else 0
+    
+    # Calculate peak busy hour
+    hourly_orders = calculate_hourly_orders(data, 24)
+    peak_hour_data = max(hourly_orders, key=lambda x: x["orders"])
+    peak_busy_hour = peak_hour_data["hour"]
+    
+    # Calculate trips per day (today)
+    daily_trips = calculate_daily_trips(data, 7)
+    trips_per_day = daily_trips[-1]["trips"] if daily_trips else 0
+    
+    return {
+        "ordersPerHour": round(orders_per_hour, 1),
+        "tripsPerDay": trips_per_day,
+        "robotUtilization": round(robot_utilization, 1),
+        "successRate": round(success_rate, 1),
+        "distanceCovered": round(total_distance / 1000, 2),  # Convert to km
+        "avgRobotSpeed": round(avg_speed, 2),
+        "peakBusyHour": peak_busy_hour,
+    }
+
+
+def get_error_logs(data):
+    """Extract error and fault logs from robot data"""
+    if not data:
+        return []
+    
+    error_logs = []
+    
+    # Brake events
+    brake_events = data.get("brake_events", [])
+    brake_engaged_count = sum(1 for e in brake_events if e.get("engaged"))
+    brake_disengaged_count = sum(1 for e in brake_events if not e.get("engaged"))
+    
+    if brake_engaged_count > 0:
+        latest_brake = max([e for e in brake_events if e.get("engaged")], 
+                          key=lambda x: x.get("timestamp", ""), default=None)
+        error_logs.append({
+            "type": "Break Engage & Disengaged",
+            "severity": "medium",
+            "count": brake_engaged_count + brake_disengaged_count,
+            "timestamp": latest_brake.get("timestamp", "") if latest_brake else datetime.now().isoformat()
+        })
+    
+    # Emergency events
+    emergency_events = data.get("emergency_events", [])
+    emergency_pressed = sum(1 for e in emergency_events if e.get("active"))
+    
+    if emergency_pressed > 0:
+        latest_emergency = max([e for e in emergency_events if e.get("active")], 
+                              key=lambda x: x.get("timestamp", ""), default=None)
+        error_logs.append({
+            "type": "Emergency Break Occurrence",
+            "severity": "high",
+            "count": emergency_pressed,
+            "timestamp": latest_emergency.get("timestamp", "") if latest_emergency else datetime.now().isoformat()
+        })
+    
+    # Mission failures
+    missions = data.get("all_missions", [])
+    failed_missions = [m for m in missions if m.get("status") == "FAILED"]
+    
+    if failed_missions:
+        latest_failed = max(failed_missions, key=lambda x: x.get("start_time", ""), default=None)
+        error_logs.append({
+            "type": "Mission Fail",
+            "severity": "high",
+            "count": len(failed_missions),
+            "timestamp": latest_failed.get("start_time", "") if latest_failed else datetime.now().isoformat()
+        })
+    
+    # Goal failures (missions that failed to reach goal)
+    goal_failures = [m for m in missions if m.get("status") == "FAILED" and "goal" in str(m.get("status", "")).lower()]
+    if goal_failures:
+        latest_goal_fail = max(goal_failures, key=lambda x: x.get("start_time", ""), default=None)
+        error_logs.append({
+            "type": "Goal Fail",
+            "severity": "high",
+            "count": len(goal_failures),
+            "timestamp": latest_goal_fail.get("start_time", "") if latest_goal_fail else datetime.now().isoformat()
+        })
+    
+    # Battery low events
+    battery_samples = data.get("battery_samples", [])
+    low_battery_events = [s for s in battery_samples if "event" in s or s.get("voltage", 0) < 20]
+    
+    if low_battery_events:
+        latest_battery = max(low_battery_events, key=lambda x: x.get("timestamp", ""), default=None)
+        error_logs.append({
+            "type": "Battery Hit 20% Threshold",
+            "severity": "medium",
+            "count": len(low_battery_events),
+            "timestamp": latest_battery.get("timestamp", "") if latest_battery else datetime.now().isoformat()
+        })
+    
+    # Navigation timeout (missions with very long duration might indicate timeout)
+    long_duration_missions = [m for m in missions if m.get("total_duration_sec", 0) > 1800]  # > 30 minutes
+    if long_duration_missions:
+        latest_timeout = max(long_duration_missions, key=lambda x: x.get("start_time", ""), default=None)
+        error_logs.append({
+            "type": "Navigation Timeout",
+            "severity": "low",
+            "count": len(long_duration_missions),
+            "timestamp": latest_timeout.get("start_time", "") if latest_timeout else datetime.now().isoformat()
+        })
+    
+    # Sensor errors (placeholder - would need actual sensor error data)
+    # This is a placeholder that can be expanded when sensor error data is available
+    
+    return error_logs
+
+
+@app.get("/api/qr-menu/admin/robot-logs/metrics")
+async def get_robot_logs_metrics():
+    """
+    Get all robot logs dashboard metrics (admin only)
+    
+    Returns:
+    - ordersPerHour: Average orders per hour
+    - tripsPerDay: Trips completed today
+    - robotUtilization: Percentage of time robot is moving
+    - successRate: Percentage of successful missions
+    - distanceCovered: Total distance in km
+    - avgRobotSpeed: Average speed in m/s
+    - peakBusyHour: Hour with most activity (0-23)
+    """
+    data = load_robot_data()
+    if not data:
+        raise HTTPException(status_code=404, detail="Robot data log file not found")
+    
+    metrics = calculate_metrics(data)
+    if not metrics:
+        raise HTTPException(status_code=500, detail="Failed to calculate metrics")
+    
+    return metrics
+
+
+@app.get("/api/qr-menu/admin/robot-logs/hourly-orders")
+async def get_hourly_orders():
+    """
+    Get hourly orders data for the last 24 hours (admin only)
+    
+    Returns array of {hour: 0-23, orders: count}
+    """
+    data = load_robot_data()
+    if not data:
+        raise HTTPException(status_code=404, detail="Robot data log file not found")
+    
+    hourly_orders = calculate_hourly_orders(data, 24)
+    return hourly_orders
+
+
+@app.get("/api/qr-menu/admin/robot-logs/daily-trips")
+async def get_daily_trips():
+    """
+    Get daily trips data for the last 7 days (admin only)
+    
+    Returns array of {date: "MMM DD", trips: count}
+    """
+    data = load_robot_data()
+    if not data:
+        raise HTTPException(status_code=404, detail="Robot data log file not found")
+    
+    daily_trips = calculate_daily_trips(data, 7)
+    return daily_trips
+
+
+@app.get("/api/qr-menu/admin/robot-logs/errors")
+async def get_robot_logs_errors():
+    """
+    Get error and fault logs (admin only)
+    
+    Returns array of error objects with:
+    - type: Error type description
+    - severity: "high", "medium", or "low"
+    - count: Number of occurrences
+    - timestamp: ISO timestamp of last occurrence
+    """
+    data = load_robot_data()
+    if not data:
+        raise HTTPException(status_code=404, detail="Robot data log file not found")
+    
+    error_logs = get_error_logs(data)
+    return error_logs
+
+
+@app.get("/api/qr-menu/admin/robot-logs/dashboard")
+async def get_robot_logs_dashboard():
+    """
+    Get complete robot logs dashboard data (admin only)
+    
+    Returns all metrics, hourly orders, daily trips, and error logs in one response
+    """
+    data = load_robot_data()
+    if not data:
+        raise HTTPException(status_code=404, detail="Robot data log file not found")
+    
+    metrics = calculate_metrics(data)
+    hourly_orders = calculate_hourly_orders(data, 24)
+    daily_trips = calculate_daily_trips(data, 7)
+    error_logs = get_error_logs(data)
+    
+    if not metrics:
+        raise HTTPException(status_code=500, detail="Failed to calculate metrics")
+    
+    return {
+        **metrics,
+        "hourlyOrders": hourly_orders,
+        "dailyTrips": daily_trips,
+        "errorLogs": error_logs
     }
 
 
